@@ -7,11 +7,11 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
+import torchvision.transforms as T
+from datasets import load_dataset
 
-from util.crop import center_crop_arr
 import util.misc as misc
 
 import copy
@@ -20,29 +20,49 @@ from engine_jit import train_one_epoch, evaluate
 from denoiser import Denoiser
 
 
+class OxfordFlowersDataset(Dataset):
+    def __init__(self, image_size):
+        self.ds = load_dataset('nelorth/oxford-flowers')['train']
+        self.transform = T.Compose([
+            T.Resize((image_size, image_size)),
+            T.RandomHorizontalFlip(),
+            T.PILToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        item = self.ds[idx]
+        pil = item['image'].convert('RGB')
+        tensor = self.transform(pil)
+        label = item['label']
+        return tensor, label
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('JiT', add_help=False)
 
     # architecture
-    parser.add_argument('--model', default='JiT-B/16', type=str, metavar='MODEL',
+    parser.add_argument('--model', default='JiT-B/4', type=str, metavar='MODEL',
                         help='Name of the model to train')
-    parser.add_argument('--img_size', default=256, type=int, help='Image size')
+    parser.add_argument('--img_size', default=64, type=int, help='Image size')
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
 
     # training
     parser.add_argument('--epochs', default=200, type=int)
-    parser.add_argument('--warmup_epochs', type=int, default=5, metavar='N',
+    parser.add_argument('--warmup_epochs', type=int, default=10, metavar='N',
                         help='Epochs to warm up LR')
-    parser.add_argument('--batch_size', default=128, type=int,
+    parser.add_argument('--batch_size', default=32, type=int,
                         help='Batch size per GPU (effective batch size = batch_size * # GPUs)')
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
                         help='Learning rate (absolute)')
-    parser.add_argument('--blr', type=float, default=5e-5, metavar='LR',
+    parser.add_argument('--blr', type=float, default=1e-4, metavar='LR',
                         help='Base learning rate: absolute_lr = base_lr * total_batch_size / 256')
-    parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
+    parser.add_argument('--min_lr', type=float, default=1e-6, metavar='LR',
                         help='Minimum LR for cyclic schedulers that hit 0')
-    parser.add_argument('--lr_schedule', type=str, default='constant',
+    parser.add_argument('--lr_schedule', type=str, default='cosine',
                         help='Learning rate schedule')
     parser.add_argument('--weight_decay', type=float, default=0.0,
                         help='Weight decay (default: 0.0)')
@@ -59,7 +79,7 @@ def get_args_parser():
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='Starting epoch')
-    parser.add_argument('--num_workers', default=12, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--pin_mem', action='store_true',
                         help='Pin CPU memory in DataLoader for faster GPU transfers')
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
@@ -76,19 +96,17 @@ def get_args_parser():
                         help='CFG interval min')
     parser.add_argument('--interval_max', default=1.0, type=float,
                         help='CFG interval max')
-    parser.add_argument('--num_images', default=50000, type=int,
+    parser.add_argument('--num_images', default=1020, type=int,
                         help='Number of images to generate')
     parser.add_argument('--eval_freq', type=int, default=40,
                         help='Frequency (in epochs) for evaluation')
     parser.add_argument('--online_eval', action='store_true')
     parser.add_argument('--evaluate_gen', action='store_true')
-    parser.add_argument('--gen_bsz', type=int, default=256,
+    parser.add_argument('--gen_bsz', type=int, default=64,
                         help='Generation batch size')
 
     # dataset
-    parser.add_argument('--data_path', default='./data/imagenet', type=str,
-                        help='Path to the dataset')
-    parser.add_argument('--class_num', default=1000, type=int)
+    parser.add_argument('--class_num', default=102, type=int)
 
     # checkpointing
     parser.add_argument('--output_dir', default='./output_dir',
@@ -97,7 +115,7 @@ def get_args_parser():
                         help='Folder that contains checkpoint to resume from')
     parser.add_argument('--save_last_freq', type=int, default=5,
                         help='Frequency (in epochs) to save checkpoints')
-    parser.add_argument('--log_freq', default=100, type=int)
+    parser.add_argument('--log_freq', default=20, type=int)
     parser.add_argument('--device', default='cuda',
                         help='Device to use for training/testing')
 
@@ -124,9 +142,9 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    cudnn.benchmark = True
+    if torch.cuda.is_available():
+        cudnn.benchmark = True
 
-    num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
     # Set up TensorBoard logging (only on main process)
@@ -136,22 +154,19 @@ def main(args):
     else:
         log_writer = None
 
-    # Data augmentation transforms
-    transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.PILToTensor()
-    ])
+    # Oxford Flowers dataset from HuggingFace
+    dataset_train = OxfordFlowersDataset(args.img_size)
+    print("Dataset: Oxford Flowers, {} samples, {} classes".format(len(dataset_train), args.class_num))
 
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    print(dataset_train)
+    if args.distributed:
+        num_tasks = misc.get_world_size()
+        sampler_train = torch.utils.data.DistributedSampler(
+            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+        )
+    else:
+        sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-    )
-    print("Sampler_train =", sampler_train)
-
-    data_loader_train = torch.utils.data.DataLoader(
+    data_loader_train = DataLoader(
         dataset_train, sampler=sampler_train,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
@@ -179,8 +194,11 @@ def main(args):
     print("Actual lr: {:.2e}".format(args.lr))
     print("Effective batch size: %d" % eff_batch_size)
 
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
-    model_without_ddp = model.module
+    if args.distributed:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model_without_ddp = model.module
+    else:
+        model_without_ddp = model
 
     # Set up optimizer with weight decay adjustment for bias and norm layers
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
@@ -195,8 +213,8 @@ def main(args):
 
         ema_state_dict1 = checkpoint['model_ema1']
         ema_state_dict2 = checkpoint['model_ema2']
-        model_without_ddp.ema_params1 = [ema_state_dict1[name].cuda() for name, _ in model_without_ddp.named_parameters()]
-        model_without_ddp.ema_params2 = [ema_state_dict2[name].cuda() for name, _ in model_without_ddp.named_parameters()]
+        model_without_ddp.ema_params1 = [ema_state_dict1[name].to(device) for name, _ in model_without_ddp.named_parameters()]
+        model_without_ddp.ema_params2 = [ema_state_dict2[name].to(device) for name, _ in model_without_ddp.named_parameters()]
         print("Resumed checkpoint from", args.resume)
 
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
@@ -215,7 +233,7 @@ def main(args):
         with torch.random.fork_rng():
             torch.manual_seed(seed)
             with torch.no_grad():
-                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
+                evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer, device=device)
         return
 
     # Training loop
@@ -247,10 +265,12 @@ def main(args):
 
         # Perform online evaluation at specified intervals
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             with torch.no_grad():
-                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer)
-            torch.cuda.empty_cache()
+                evaluate(model_without_ddp, args, epoch, batch_size=args.gen_bsz, log_writer=log_writer, device=device)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:
             log_writer.flush()

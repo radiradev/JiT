@@ -94,7 +94,7 @@ class LabelEmbedder(nn.Module):
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
+    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype, device=query.device)
 
     with torch.cuda.amp.autocast(enabled=False):
         attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
@@ -359,6 +359,14 @@ class JiT(nn.Module):
         return output
 
 
+def JiT_B_4(**kwargs):
+    return JiT(depth=12, hidden_size=768, num_heads=12,
+               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=4, **kwargs)
+
+def JiT_B_8(**kwargs):
+    return JiT(depth=12, hidden_size=768, num_heads=12,
+               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=8, **kwargs)
+
 def JiT_B_16(**kwargs):
     return JiT(depth=12, hidden_size=768, num_heads=12,
                bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=16, **kwargs)
@@ -385,6 +393,8 @@ def JiT_H_32(**kwargs):
 
 
 JiT_models = {
+    'JiT-B/4': JiT_B_4,
+    'JiT-B/8': JiT_B_8,
     'JiT-B/16': JiT_B_16,
     'JiT-B/32': JiT_B_32,
     'JiT-L/16': JiT_L_16,

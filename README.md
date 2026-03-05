@@ -36,19 +36,16 @@ git clone https://github.com/LTH14/JiT.git
 cd JiT
 ```
 
-A suitable [conda](https://conda.io/) environment named `jit` can be created and activated with:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and set up the environment:
 
 ```
-conda env create -f environment.yaml
-conda activate jit
+uv sync
 ```
 
-If you get ```undefined symbol: iJIT_NotifyEvent``` when importing ```torch```, simply
+To run commands within the environment:
 ```
-pip uninstall torch
-pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
+uv run <command>
 ```
-Check this [issue](https://github.com/conda/conda/issues/13812#issuecomment-2071445372) for more details.
 
 ### Training
 The below training scripts have been tested on 8 H200 GPUs.
