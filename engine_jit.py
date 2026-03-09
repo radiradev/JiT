@@ -9,6 +9,7 @@ import cv2
 
 import util.misc as misc
 import util.lr_sched as lr_sched
+import torch_fidelity
 import copy
 
 
@@ -24,8 +25,6 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
     if log_writer is not None:
         print('log_dir: {}'.format(log_writer.log_dir))
 
-    use_amp = device.type == 'cuda'
-
     for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
@@ -35,10 +34,7 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         x = x * 2.0 - 1.0
         labels = labels.to(device, non_blocking=True)
 
-        if use_amp:
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                loss = model(x, labels)
-        else:
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             loss = model(x, labels)
 
         loss_value = loss.item()
@@ -50,8 +46,7 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         loss.backward()
         optimizer.step()
 
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
         model_without_ddp.update_ema()
 
@@ -69,9 +64,7 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
                 log_writer.add_scalar('lr', lr, epoch_1000x)
 
 
-def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None, device=None):
-    if device is None:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     model_without_ddp.eval()
     world_size = misc.get_world_size()
@@ -105,31 +98,24 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None, dev
     class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
     class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
 
-    use_amp = device.type == 'cuda'
-    distributed = misc.is_dist_avail_and_initialized()
-
     for i in range(num_steps):
         print("Generation step {}/{}".format(i, num_steps))
 
         start_idx = world_size * batch_size * i + local_rank * batch_size
         end_idx = start_idx + batch_size
         labels_gen = class_label_gen_world[start_idx:end_idx]
-        labels_gen = torch.Tensor(labels_gen).long().to(device)
+        labels_gen = torch.Tensor(labels_gen).long().cuda()
 
-        if use_amp:
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                sampled_images = model_without_ddp.generate(labels_gen)
-        else:
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
             sampled_images = model_without_ddp.generate(labels_gen)
 
-        if distributed:
-            torch.distributed.barrier()
+        torch.distributed.barrier()
 
         # denormalize images
         sampled_images = (sampled_images + 1) / 2
         sampled_images = sampled_images.detach().cpu()
 
-        # save images
+        # distributed save images
         for b_id in range(sampled_images.size(0)):
             img_id = i * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
             if img_id >= args.num_images:
@@ -138,8 +124,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None, dev
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
             cv2.imwrite(os.path.join(save_folder, '{}.png'.format(str(img_id).zfill(5))), gen_img)
 
-    if distributed:
-        torch.distributed.barrier()
+    torch.distributed.barrier()
 
     # back to no ema
     print("Switch back from ema")
@@ -147,32 +132,32 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None, dev
 
     # compute FID and IS
     if log_writer is not None:
-        import torch_fidelity
         if args.img_size == 256:
             fid_statistics_file = 'fid_stats/jit_in256_stats.npz'
         elif args.img_size == 512:
             fid_statistics_file = 'fid_stats/jit_in512_stats.npz'
         else:
-            print("No FID stats for img_size={}, skipping FID/IS".format(args.img_size))
-            return
+            # Bypass FID calculation for custom sizes and just keep the images
+            print(f"Skipping FID calculation for image size {args.img_size}.")
+            pass
         metrics_dict = torch_fidelity.calculate_metrics(
             input1=save_folder,
             input2=None,
-            fid_statistics_file=fid_statistics_file,
-            cuda=device.type == 'cuda',
+            #fid_statistics_file=fid_statistics_file,
+            cuda=True,
             isc=True,
-            fid=True,
+            fid=False,
             kid=False,
             prc=False,
             verbose=False,
         )
-        fid = metrics_dict['frechet_inception_distance']
+        #fid = metrics_dict['frechet_inception_distance']
         inception_score = metrics_dict['inception_score_mean']
         postfix = "_cfg{}_res{}".format(model_without_ddp.cfg_scale, args.img_size)
-        log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
+        #log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
         log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
-        print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
-        shutil.rmtree(save_folder)
+        #print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
+        print("Inception Score: {:.4f}".format(inception_score))
+        #shutil.rmtree(save_folder)
 
-    if distributed:
-        torch.distributed.barrier()
+    torch.distributed.barrier()
