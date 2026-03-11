@@ -15,7 +15,7 @@ from util.crop import center_crop_arr
 import util.misc as misc
 
 import copy
-from engine_jit import train_one_epoch, train_one_epoch_soflow, evaluate
+from engine_jit import train_one_epoch, train_one_epoch_soflow, train_one_epoch_self_flow, evaluate
 from datasets import load_dataset
 from denoiser import Denoiser
 
@@ -26,20 +26,20 @@ class OxfordFlowersDataset(torch.utils.data.Dataset):
             transforms.Resize((image_size, image_size)),
             transforms.PILToTensor()
         ])
-        
+
     def __len__(self):
         return len(self.ds)
-        
+
     def __getitem__(self, idx):
         item = self.ds[idx]
-        
+
         # Ensure image is RGB (3 channels)
         pil = item['image'].convert('RGB')
         tensor = self.transform(pil)
-        
-        # Extract the label
+
+        # Extract the label (kept for dataloader compatibility, unused by model)
         label = item['label']
-        
+
         # Return tensor as [0, 255] (engine_jit.py normalizes it) along with label
         return tensor, label
 
@@ -78,7 +78,6 @@ def get_args_parser():
     parser.add_argument('--P_std', default=0.8, type=float)
     parser.add_argument('--noise_scale', default=1.0, type=float)
     parser.add_argument('--t_eps', default=5e-2, type=float)
-    parser.add_argument('--label_drop_prob', default=0.1, type=float)
 
     # soflow
     parser.add_argument('--soflow', action='store_true', help='Enable SoFlow (solution consistency) training')
@@ -87,6 +86,13 @@ def get_args_parser():
     parser.add_argument('--r_end', default=0.002, type=float, help='Final r value for consistency step size')
     parser.add_argument('--r_total_steps', default=100000, type=int, help='Steps over which r decays')
     parser.add_argument('--adaptive_loss_p', default=0.5, type=float, help='Exponent for adaptive loss weighting')
+
+    # self-flow
+    parser.add_argument('--self_flow', action='store_true', help='Enable Self-Flow (representation alignment) training')
+    parser.add_argument('--repr_loss_weight', default=1.0, type=float, help='Weight for representation alignment loss')
+    parser.add_argument('--student_align_layer', default=3, type=int, help='Student layer index for repr alignment (B:3, L:6, XL:8)')
+    parser.add_argument('--teacher_align_layer', default=8, type=int, help='Teacher layer index for repr alignment (B:8, L:16, XL:20)')
+    parser.add_argument('--self_flow_ema_decay', default=0.999, type=float, help='EMA decay for self-flow teacher')
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -102,12 +108,6 @@ def get_args_parser():
                         help='ODE samping method')
     parser.add_argument('--num_sampling_steps', default=50, type=int,
                         help='Sampling steps')
-    parser.add_argument('--cfg', default=1.0, type=float,
-                        help='Classifier-free guidance factor')
-    parser.add_argument('--interval_min', default=0.0, type=float,
-                        help='CFG interval min')
-    parser.add_argument('--interval_max', default=1.0, type=float,
-                        help='CFG interval max')
     parser.add_argument('--num_images', default=50000, type=int,
                         help='Number of images to generate')
     parser.add_argument('--eval_freq', type=int, default=40,
@@ -120,7 +120,6 @@ def get_args_parser():
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
                         help='Path to the dataset')
-    parser.add_argument('--class_num', default=1000, type=int)
 
     # checkpointing
     parser.add_argument('--output_dir', default='./output_dir',
@@ -178,19 +177,10 @@ def main(args):
     else:
         log_writer = None
 
-    # Data augmentation transforms
-    transform_train = transforms.Compose([
-        transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.PILToTensor()
-    ])
-
-    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    # hardcoded to use Oxford Flowers dataset     
+    # hardcoded to use Oxford Flowers dataset
     dataset_train = OxfordFlowersDataset(image_size=args.img_size)
     print(f"Loaded Oxford Flowers dataset with {len(dataset_train)} images.")
-    # plot a few samples to verify
-    
+
     sampler_train = torch.utils.data.DistributedSampler(
         dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
     )
@@ -223,6 +213,10 @@ def main(args):
     print("Base lr: {:.2e}".format(args.lr * 256 / eff_batch_size))
     print("Actual lr: {:.2e}".format(args.lr))
     print("Effective batch size: %d" % eff_batch_size)
+
+    # Initialize self-flow teacher + projector before DDP wrapping
+    if args.self_flow:
+        model._init_self_flow()
 
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
     model_without_ddp = model.module
@@ -270,7 +264,9 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        if args.soflow:
+        if args.self_flow:
+            train_one_epoch_self_flow(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
+        elif args.soflow:
             train_one_epoch_soflow(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
         else:
             train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)

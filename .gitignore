@@ -3,3 +3,6 @@ uv.lock
 output_dir/
 logs/
 output*/
+rectified-flow-pytorch/
+.venv/
+.claude/

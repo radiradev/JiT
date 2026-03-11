@@ -47,17 +47,16 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
     if log_writer is not None:
         print('wandb logging enabled')
 
-    for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (x, _labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # per iteration (instead of per epoch) lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         # normalize image to [-1, 1]
         x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
         x = x * 2.0 - 1.0
-        labels = labels.to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            loss = model(x, labels)
+            loss = model(x)
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -98,20 +97,19 @@ def train_one_epoch_soflow(model, model_without_ddp, data_loader, optimizer, dev
     if log_writer is not None:
         print('wandb logging enabled')
 
-    for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for data_iter_step, (x, _labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # per iteration lr scheduler
         lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
 
         # normalize image to [-1, 1]
         x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
         x = x * 2.0 - 1.0
-        labels = labels.to(device, non_blocking=True)
 
         global_step = epoch * len(data_loader) + data_iter_step
         r = get_r_value(global_step, args)
 
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            loss, flow_loss, scm_loss = model(x, labels, r_value=r)
+            loss, flow_loss, scm_loss = model(x, r_value=r)
 
         loss_value = loss.item()
         if not math.isfinite(loss_value):
@@ -149,6 +147,67 @@ def train_one_epoch_soflow(model, model_without_ddp, data_loader, optimizer, dev
                 })
 
 
+def train_one_epoch_self_flow(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
+    model.train(True)
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('flow_loss', misc.SmoothedValue(window_size=20, fmt='{avg:.4f}'))
+    metric_logger.add_meter('repr_loss', misc.SmoothedValue(window_size=20, fmt='{avg:.4f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = 20
+
+    optimizer.zero_grad()
+
+    if log_writer is not None:
+        print('wandb logging enabled')
+
+    for data_iter_step, (x, _labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # per iteration lr scheduler
+        lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+
+        # normalize image to [-1, 1]
+        x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
+        x = x * 2.0 - 1.0
+
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            loss, flow_loss, repr_loss = model_without_ddp._forward_self_flow(x)
+
+        loss_value = loss.item()
+        if not math.isfinite(loss_value):
+            print("Loss is {}, stopping training".format(loss_value))
+            sys.exit(1)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        torch.cuda.synchronize()
+
+        model_without_ddp.update_ema()
+        model_without_ddp.update_self_flow_teacher()
+
+        metric_logger.update(loss=loss_value)
+        metric_logger.update(flow_loss=flow_loss.item())
+        metric_logger.update(repr_loss=repr_loss.item())
+        lr = optimizer.param_groups[0]["lr"]
+        metric_logger.update(lr=lr)
+
+        loss_value_reduce = misc.all_reduce_mean(loss_value)
+        flow_loss_reduce = misc.all_reduce_mean(flow_loss.item())
+        repr_loss_reduce = misc.all_reduce_mean(repr_loss.item())
+
+        if log_writer is not None:
+            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+            if data_iter_step % args.log_freq == 0:
+                log_writer.log({
+                    'train_loss': loss_value_reduce,
+                    'flow_loss': flow_loss_reduce,
+                    'repr_loss': repr_loss_reduce,
+                    'lr': lr,
+                    'epoch_1000x': epoch_1000x,
+                })
+
+
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     model_without_ddp.eval()
@@ -159,9 +218,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     # Construct the folder name for saving generated images.
     save_folder = os.path.join(
         args.output_dir,
-        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}".format(
-            model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale,
-            model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size
+        "{}-steps{}-image{}-res{}".format(
+            model_without_ddp.method, model_without_ddp.steps, args.num_images, args.img_size
         )
     )
     print("Save to:", save_folder)
@@ -177,22 +235,11 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     print("Switch to ema")
     model_without_ddp.load_state_dict(ema_state_dict)
 
-    # ensure that the number of images per class is equal.
-    class_num = args.class_num
-    assert args.num_images % class_num == 0, "Number of images per class must be the same"
-    class_label_gen_world = np.arange(0, class_num).repeat(args.num_images // class_num)
-    class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
-
     for i in range(num_steps):
         print("Generation step {}/{}".format(i, num_steps))
 
-        start_idx = world_size * batch_size * i + local_rank * batch_size
-        end_idx = start_idx + batch_size
-        labels_gen = class_label_gen_world[start_idx:end_idx]
-        labels_gen = torch.Tensor(labels_gen).long().cuda()
-
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            sampled_images = model_without_ddp.generate(labels_gen)
+            sampled_images = model_without_ddp.generate()
 
         torch.distributed.barrier()
 
@@ -244,7 +291,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
             **({"fid_statistics_file": fid_kwargs["fid_statistics_file"]} if "fid_statistics_file" in fid_kwargs else {}),
         )
         inception_score = metrics_dict['inception_score_mean']
-        postfix = "_cfg{}_res{}".format(model_without_ddp.cfg_scale, args.img_size)
+        postfix = "_res{}".format(args.img_size)
         log_dict = {'is{}'.format(postfix): inception_score, 'epoch': epoch}
         if compute_fid:
             fid = metrics_dict['frechet_inception_distance']

@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --job-name=jit-soflow
+#SBATCH --job-name=jit-self-flow
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --time=12:00:00
 #SBATCH --gpus-per-node=4
-#SBATCH --output=logs/jit-soflow_%j.out
-#SBATCH --error=logs/jit-soflow_%j.out
+#SBATCH --output=logs/jit-self-flow_%j.out
+#SBATCH --error=logs/jit-self-flow_%j.out
 
 echo "=========================================="
 echo "Job ID:      $SLURM_JOB_ID"
@@ -27,9 +27,9 @@ torchrun --nproc_per_node=4 --nnodes=1 --node_rank=0 \
   --batch_size 4 --blr 5e-3 \
   --epochs 600 --warmup_epochs 5 \
   --gen_bsz 32 --num_images 102 \
-  --output_dir /users/rradev/JiT/output_soflow \
-  --wandb_run_name soflow \
-  --soflow --lambda_fm 0.75 --r_init 0.1 --r_end 0.002 --r_total_steps 100000 \
+  --output_dir /users/rradev/JiT/output_self_flow \
+  --wandb_run_name self_flow \
+  --self_flow --repr_loss_weight 1.0 --self_flow_ema_decay 0.999 \
   --online_eval
 
 echo "=========================================="
