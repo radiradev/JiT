@@ -25,6 +25,10 @@ class Denoiser(nn.Module):
         self.t_eps = args.t_eps
         self.noise_scale = args.noise_scale
 
+        # soflow hyperparams
+        self.lambda_fm = getattr(args, 'lambda_fm', 0.75)
+        self.adaptive_loss_p = getattr(args, 'adaptive_loss_p', 0.5)
+
         # ema
         self.ema_decay1 = args.ema_decay1
         self.ema_decay2 = args.ema_decay2
@@ -46,7 +50,10 @@ class Denoiser(nn.Module):
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(z)
 
-    def forward(self, x, labels):
+    def forward(self, x, labels, r_value=None):
+        if r_value is not None:
+            return self._forward_soflow(x, labels, r_value)
+
         labels_dropped = self.drop_labels(labels) if self.training else labels
 
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
@@ -63,6 +70,59 @@ class Denoiser(nn.Module):
         loss = loss.mean(dim=(1, 2, 3)).mean()
 
         return loss
+
+    def _forward_soflow(self, x, labels, r_value):
+        """SoFlow: flow matching + solution consistency loss."""
+        b = x.size(0)
+        labels_dropped = self.drop_labels(labels) if self.training else labels
+
+        # split batch into FM and consistency samples
+        fm_mask = torch.rand(b, device=x.device) < self.lambda_fm
+        scm_mask = ~fm_mask
+
+        t = self.sample_t(b, device=x.device).view(-1, *([1] * (x.ndim - 1)))
+        e = torch.randn_like(x) * self.noise_scale
+
+        # --- Flow matching loss on fm_mask samples ---
+        z_t = t * x + (1 - t) * e
+        v_target = (x - z_t) / (1 - t).clamp_min(self.t_eps)
+
+        x_pred_t = self.net(z_t, t.flatten(), labels_dropped)
+        v_pred = (x_pred_t - z_t) / (1 - t).clamp_min(self.t_eps)
+
+        fm_per_sample = ((v_target - v_pred) ** 2).mean(dim=(1, 2, 3))
+
+        # adaptive weighting for FM: weight = 1 / (per_sample_loss^p + eps)
+        with torch.no_grad():
+            fm_weights = 1.0 / (fm_per_sample.detach() ** self.adaptive_loss_p + 1e-6)
+            fm_weights = fm_weights / fm_weights.mean()
+
+        fm_loss = (fm_per_sample * fm_weights * fm_mask.float()).sum() / fm_mask.float().sum().clamp_min(1.0)
+
+        # --- Solution consistency loss on scm_mask samples ---
+        # l = t + (1 - t) * r  (a point closer to clean than t)
+        l = t + (1 - t) * r_value
+        l = l.clamp(max=1.0 - self.t_eps)
+
+        z_l = l * x + (1 - l) * e  # same noise e, different interpolation point
+
+        # teacher prediction at l (detached)
+        with torch.no_grad():
+            x_pred_l = self.net(z_l, l.flatten(), labels_dropped)
+
+        # student prediction at t (already computed above as x_pred_t)
+        scm_per_sample = ((x_pred_t - x_pred_l) ** 2).mean(dim=(1, 2, 3))
+
+        # adaptive weighting for consistency
+        with torch.no_grad():
+            scm_weights = 1.0 / (scm_per_sample.detach() ** self.adaptive_loss_p + 1e-6)
+            scm_weights = scm_weights / scm_weights.mean()
+
+        scm_loss = (scm_per_sample * scm_weights * scm_mask.float()).sum() / scm_mask.float().sum().clamp_min(1.0)
+
+        total_loss = fm_loss + scm_loss
+
+        return total_loss, fm_loss.detach(), scm_loss.detach()
 
     @torch.no_grad()
     def generate(self, labels):

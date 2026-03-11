@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
+import wandb
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
@@ -15,7 +15,7 @@ from util.crop import center_crop_arr
 import util.misc as misc
 
 import copy
-from engine_jit import train_one_epoch, evaluate
+from engine_jit import train_one_epoch, train_one_epoch_soflow, evaluate
 from datasets import load_dataset
 from denoiser import Denoiser
 
@@ -80,6 +80,14 @@ def get_args_parser():
     parser.add_argument('--t_eps', default=5e-2, type=float)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
 
+    # soflow
+    parser.add_argument('--soflow', action='store_true', help='Enable SoFlow (solution consistency) training')
+    parser.add_argument('--lambda_fm', default=0.75, type=float, help='Fraction of batch for FM loss (rest for consistency)')
+    parser.add_argument('--r_init', default=0.1, type=float, help='Initial r value for consistency step size')
+    parser.add_argument('--r_end', default=0.002, type=float, help='Final r value for consistency step size')
+    parser.add_argument('--r_total_steps', default=100000, type=int, help='Steps over which r decays')
+    parser.add_argument('--adaptive_loss_p', default=0.5, type=float, help='Exponent for adaptive loss weighting')
+
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='Starting epoch')
@@ -122,6 +130,10 @@ def get_args_parser():
     parser.add_argument('--save_last_freq', type=int, default=5,
                         help='Frequency (in epochs) to save checkpoints')
     parser.add_argument('--log_freq', default=100, type=int)
+    parser.add_argument('--wandb_project', default='JiT', type=str,
+                        help='wandb project name')
+    parser.add_argument('--wandb_run_name', default=None, type=str,
+                        help='wandb run name (default: auto-generated)')
     parser.add_argument('--device', default='cuda',
                         help='Device to use for training/testing')
 
@@ -153,10 +165,16 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # Set up TensorBoard logging (only on main process)
+    # Set up wandb logging (only on main process)
     if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.output_dir)
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+            dir=args.output_dir,
+        )
+        log_writer = wandb
     else:
         log_writer = None
 
@@ -252,7 +270,10 @@ def main(args):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
+        if args.soflow:
+            train_one_epoch_soflow(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
+        else:
+            train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
 
         # Save checkpoint periodically
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
@@ -280,7 +301,7 @@ def main(args):
             torch.cuda.empty_cache()
 
         if misc.is_main_process() and log_writer is not None:
-            log_writer.flush()
+            pass  # wandb auto-syncs
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

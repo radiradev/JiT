@@ -11,6 +11,28 @@ import util.misc as misc
 import util.lr_sched as lr_sched
 import torch_fidelity
 import copy
+import torchvision.transforms as transforms
+
+
+def _cache_real_images(args, real_folder):
+    """Save real dataset images to disk for FID computation."""
+    from datasets import load_dataset
+    ds = load_dataset('nelorth/oxford-flowers')['train']
+    resize = transforms.Resize((args.img_size, args.img_size))
+    for i, item in enumerate(ds):
+        img = resize(item['image'].convert('RGB'))
+        img_np = np.array(img)[:, :, ::-1]  # RGB -> BGR for cv2
+        cv2.imwrite(os.path.join(real_folder, '{}.png'.format(str(i).zfill(5))), img_np)
+    print(f"Cached {len(ds)} real images to {real_folder}")
+
+
+def get_r_value(step, args):
+    """Exponential decay of r from r_init to r_end over r_total_steps."""
+    r_init = args.r_init
+    r_end = args.r_end
+    total = args.r_total_steps
+    progress = min(step / total, 1.0)
+    return r_init * (r_end / r_init) ** progress
 
 
 def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
@@ -23,7 +45,7 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
     optimizer.zero_grad()
 
     if log_writer is not None:
-        print('log_dir: {}'.format(log_writer.log_dir))
+        print('wandb logging enabled')
 
     for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         # per iteration (instead of per epoch) lr scheduler
@@ -57,11 +79,74 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
         loss_value_reduce = misc.all_reduce_mean(loss_value)
 
         if log_writer is not None:
-            # Use epoch_1000x as the x-axis in TensorBoard to calibrate curves.
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             if data_iter_step % args.log_freq == 0:
-                log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-                log_writer.add_scalar('lr', lr, epoch_1000x)
+                log_writer.log({'train_loss': loss_value_reduce, 'lr': lr, 'epoch_1000x': epoch_1000x})
+
+
+def train_one_epoch_soflow(model, model_without_ddp, data_loader, optimizer, device, epoch, log_writer=None, args=None):
+    model.train(True)
+    metric_logger = misc.MetricLogger(delimiter="  ")
+    metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('flow_loss', misc.SmoothedValue(window_size=20, fmt='{avg:.4f}'))
+    metric_logger.add_meter('scm_loss', misc.SmoothedValue(window_size=20, fmt='{avg:.4f}'))
+    header = 'Epoch: [{}]'.format(epoch)
+    print_freq = 20
+
+    optimizer.zero_grad()
+
+    if log_writer is not None:
+        print('wandb logging enabled')
+
+    for data_iter_step, (x, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        # per iteration lr scheduler
+        lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
+
+        # normalize image to [-1, 1]
+        x = x.to(device, non_blocking=True).to(torch.float32).div_(255)
+        x = x * 2.0 - 1.0
+        labels = labels.to(device, non_blocking=True)
+
+        global_step = epoch * len(data_loader) + data_iter_step
+        r = get_r_value(global_step, args)
+
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            loss, flow_loss, scm_loss = model(x, labels, r_value=r)
+
+        loss_value = loss.item()
+        if not math.isfinite(loss_value):
+            print("Loss is {}, stopping training".format(loss_value))
+            sys.exit(1)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        torch.cuda.synchronize()
+
+        model_without_ddp.update_ema()
+
+        metric_logger.update(loss=loss_value)
+        metric_logger.update(flow_loss=flow_loss.item())
+        metric_logger.update(scm_loss=scm_loss.item())
+        lr = optimizer.param_groups[0]["lr"]
+        metric_logger.update(lr=lr)
+
+        loss_value_reduce = misc.all_reduce_mean(loss_value)
+        flow_loss_reduce = misc.all_reduce_mean(flow_loss.item())
+        scm_loss_reduce = misc.all_reduce_mean(scm_loss.item())
+
+        if log_writer is not None:
+            epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
+            if data_iter_step % args.log_freq == 0:
+                log_writer.log({
+                    'train_loss': loss_value_reduce,
+                    'flow_loss': flow_loss_reduce,
+                    'scm_loss': scm_loss_reduce,
+                    'r_value': r,
+                    'lr': lr,
+                    'epoch_1000x': epoch_1000x,
+                })
 
 
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
@@ -132,32 +217,41 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     # compute FID and IS
     if log_writer is not None:
+        fid_kwargs = {}
         if args.img_size == 256:
-            fid_statistics_file = 'fid_stats/jit_in256_stats.npz'
+            fid_kwargs = dict(fid_statistics_file='fid_stats/jit_in256_stats.npz')
         elif args.img_size == 512:
-            fid_statistics_file = 'fid_stats/jit_in512_stats.npz'
+            fid_kwargs = dict(fid_statistics_file='fid_stats/jit_in512_stats.npz')
         else:
-            # Bypass FID calculation for custom sizes and just keep the images
-            print(f"Skipping FID calculation for image size {args.img_size}.")
-            pass
+            # For custom sizes (e.g. 64px), compute FID against cached real images
+            real_folder = os.path.join(args.output_dir, f'real_images_{args.img_size}')
+            if not os.path.exists(real_folder):
+                print(f"Caching real images to {real_folder} for FID computation...")
+                os.makedirs(real_folder, exist_ok=True)
+                _cache_real_images(args, real_folder)
+            fid_kwargs = dict(input2=real_folder)
+
+        compute_fid = len(fid_kwargs) > 0
         metrics_dict = torch_fidelity.calculate_metrics(
             input1=save_folder,
-            input2=None,
-            #fid_statistics_file=fid_statistics_file,
+            input2=fid_kwargs.get('input2'),
             cuda=True,
             isc=True,
-            fid=False,
+            fid=compute_fid,
             kid=False,
             prc=False,
             verbose=False,
+            **({"fid_statistics_file": fid_kwargs["fid_statistics_file"]} if "fid_statistics_file" in fid_kwargs else {}),
         )
-        #fid = metrics_dict['frechet_inception_distance']
         inception_score = metrics_dict['inception_score_mean']
         postfix = "_cfg{}_res{}".format(model_without_ddp.cfg_scale, args.img_size)
-        #log_writer.add_scalar('fid{}'.format(postfix), fid, epoch)
-        log_writer.add_scalar('is{}'.format(postfix), inception_score, epoch)
-        #print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
-        print("Inception Score: {:.4f}".format(inception_score))
-        #shutil.rmtree(save_folder)
+        log_dict = {'is{}'.format(postfix): inception_score, 'epoch': epoch}
+        if compute_fid:
+            fid = metrics_dict['frechet_inception_distance']
+            log_dict['fid{}'.format(postfix)] = fid
+            print("FID: {:.4f}, Inception Score: {:.4f}".format(fid, inception_score))
+        else:
+            print("Inception Score: {:.4f}".format(inception_score))
+        log_writer.log(log_dict)
 
     torch.distributed.barrier()
